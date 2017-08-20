@@ -30,6 +30,7 @@
 
 from __future__ import division
 import os
+import rospy
 import rospkg
 
 from python_qt_binding import loadUi
@@ -37,12 +38,14 @@ from python_qt_binding.QtCore import QAbstractListModel, QFile, QIODevice, Qt, S
 from python_qt_binding.QtGui import QIcon, QImage, QPainter
 from python_qt_binding.QtWidgets import QCompleter, QFileDialog, QGraphicsScene, QWidget
 from python_qt_binding.QtSvg import QSvgGenerator
+from python_qt_binding.QtWidgets import QGraphicsEllipseItem, QGraphicsRectItem
 
 import rosgraph.impl.graph
 import rosservice
 import rostopic
 
 from qt_dotgraph.dot_to_qt import DotToQtGenerator
+from qt_dotgraph.node_item import NodeItem
 # pydot requires some hacks
 from qt_dotgraph.pydotfactory import PydotFactory
 from rqt_gui_py.plugin import Plugin
@@ -51,6 +54,8 @@ from rqt_gui_py.plugin import Plugin
 
 from .dotcode import RosGraphDotcodeGenerator, NODE_NODE_GRAPH, NODE_TOPIC_ALL_GRAPH, NODE_TOPIC_GRAPH
 from .interactive_graphics_view import InteractiveGraphicsView
+
+from .popup_menu import PopupMenu, TopicPopupMenu, NodePopupMenu
 
 
 class RepeatedWordCompleter(QCompleter):
@@ -91,6 +96,69 @@ class NamespaceCompletionModel(QAbstractListModel):
             return self.names[index.row()]
         return None
 
+class FilterList:
+    def __init__(self, filter_text=None):
+        if filter_text == None:
+            self.list = []
+        else:
+            self.list = filter_text.split(",")
+            if "" in self.list: # I don't know why this is needed...
+                self.list.remove("")
+
+    def _remove(self, name):
+        if name[0] == "-":
+            name = name[1:]
+        if name in self.list:
+            self.list.remove(name)
+        if "-" + name in self.list:
+            self.list.remove("-" + name)
+        
+    def add(self, nodes):
+        if not type(nodes) == list:
+            nodes = [nodes]
+        for node in nodes:
+            self._remove(node)
+            self.list.append(node)
+
+    def try_to_add(self, nodes):
+        if not type(nodes) == list:
+            nodes = [nodes]
+        for node in nodes:
+            if node[0] == "-":
+                node = node[1:]
+            if node not in self.list and "-" + node not in self.list:
+                self.list.append(node)
+
+    def clear(self):
+        for i in self.list:
+            self.list.remove(i)
+        self.list.append("/")
+
+    def text(self):
+        return ",".join(self.list)
+
+
+class GraphicsScene(QGraphicsScene):
+    def __init__(self, ros_graph):
+        super(GraphicsScene, self).__init__()
+        self.ros_graph = ros_graph
+
+    def contextMenuEvent(self, event):
+        for node_item in self.ros_graph.nodes.values():
+            if node_item.contains(event.scenePos()):
+                if (type(node_item._graphics_item) == QGraphicsRectItem):
+                    rospy.logdebug("GraphicsScene.contextMenuEvent(): TOPIC %s"
+                                  % node_item._label.text())
+                    TopicPopupMenu(self.ros_graph, event, node_item._label.text())
+                elif (type(node_item._graphics_item) == QGraphicsEllipseItem):
+                    rospy.logdebug("GraphicsScene.contextMenuEvent(): NODE %s"
+                                  % node_item._label.text())
+                    NodePopupMenu(self.ros_graph, event, node_item._label.text())
+                event.accept
+                return
+        rospy.logdebug("GraphicsScene.contextMenuEvent(): none")
+        PopupMenu(self.ros_graph, event)
+
 
 class RosGraph(Plugin):
 
@@ -121,7 +189,7 @@ class RosGraph(Plugin):
         if context.serial_number() > 1:
             self._widget.setWindowTitle(self._widget.windowTitle() + (' (%d)' % context.serial_number()))
 
-        self._scene = QGraphicsScene()
+        self._scene = GraphicsScene(self)
         self._scene.setBackgroundBrush(Qt.white)
         self._widget.graphics_view.setScene(self._scene)
 
@@ -180,7 +248,9 @@ class RosGraph(Plugin):
     def save_settings(self, plugin_settings, instance_settings):
         instance_settings.set_value('graph_type_combo_box_index', self._widget.graph_type_combo_box.currentIndex())
         instance_settings.set_value('filter_line_edit_text', self._widget.filter_line_edit.text())
+        instance_settings.set_value('filter_normalized', self._filter_normalized)
         instance_settings.set_value('topic_filter_line_edit_text', self._widget.topic_filter_line_edit.text())
+        instance_settings.set_value('topic_filter_normalized', self._topic_filter_normalized)
         instance_settings.set_value('namespace_cluster_check_box_state', self._widget.namespace_cluster_check_box.isChecked())
         instance_settings.set_value('actionlib_check_box_state', self._widget.actionlib_check_box.isChecked())
         instance_settings.set_value('dead_sinks_check_box_state', self._widget.dead_sinks_check_box.isChecked())
@@ -193,7 +263,9 @@ class RosGraph(Plugin):
     def restore_settings(self, plugin_settings, instance_settings):
         self._widget.graph_type_combo_box.setCurrentIndex(int(instance_settings.value('graph_type_combo_box_index', 0)))
         self._widget.filter_line_edit.setText(instance_settings.value('filter_line_edit_text', '/'))
+        self._filter_normalized = instance_settings.value('filter_normalized', False)
         self._widget.topic_filter_line_edit.setText(instance_settings.value('topic_filter_line_edit_text', '/'))
+        self._topic_filter_normalized = instance_settings.value('topic_filter_normalized', False)
         self._widget.namespace_cluster_check_box.setChecked(instance_settings.value('namespace_cluster_check_box_state', True) in [True, 'true'])
         self._widget.actionlib_check_box.setChecked(instance_settings.value('actionlib_check_box_state', True) in [True, 'true'])
         self._widget.dead_sinks_check_box.setChecked(instance_settings.value('dead_sinks_check_box_state', True) in [True, 'true'])
@@ -203,6 +275,137 @@ class RosGraph(Plugin):
         self._widget.auto_fit_graph_check_box.setChecked(instance_settings.value('auto_fit_graph_check_box_state', True) in [True, 'true'])
         self._widget.highlight_connections_check_box.setChecked(instance_settings.value('highlight_connections_check_box_state', True) in [True, 'true'])
         self.initialized = True
+        self._refresh_rosgraph()
+
+    def _normalize_filter(self):
+        if not self._filter_normalized:
+            self._filter_normalized = True
+            filter_list = FilterList(self._widget.filter_line_edit.text())
+            nodes = [e.start for e in self._graph.nn_edges]
+            nodes.extend([e.end for e in self._graph.nn_edges])
+            filter_list.try_to_add(nodes)
+            self._widget.filter_line_edit.setText(filter_list.text())
+
+    def _normalize_topic_filter(self):
+        if not self._topic_filter_normalized:
+            self._topic_filter_normalized = True
+            filter_list = FilterList(self._widget.topic_filter_line_edit.text())
+            nodes = [e.start[1:] for e in self._graph.nt_edges if e.start[0] == " "]
+            nodes.extend([e.end[1:] for e in self._graph.nt_edges if e.end[0] == " "])
+            filter_list.try_to_add(nodes)
+            self._widget.topic_filter_line_edit.setText(filter_list.text())
+
+    def _add_node(self, nodes):
+        filter_list = FilterList(self._widget.filter_line_edit.text())
+        filter_list.add(nodes)
+        self._widget.filter_line_edit.setText(filter_list.text())
+
+    def _clear_all(self):
+        filter_list = FilterList()
+        filter_list.clear()
+        self._widget.topic_filter_line_edit.setText(filter_list.text())
+        self._topic_filter_normalized = False
+        self._widget.filter_line_edit.setText(filter_list.text())
+        self._filter_normalized = False
+
+    def clear_all(self):
+        self._clear_all()
+        self._refresh_rosgraph()
+
+    def show_neighbors(self, node):
+        graph_mode = self._widget.graph_type_combo_box.itemData(
+            self._widget.graph_type_combo_box.currentIndex())
+        if graph_mode == NODE_NODE_GRAPH:
+            self._normalize_filter()
+            filter_list = FilterList(self._widget.filter_line_edit.text())
+            neighbors = [e.end for e in self._graph.nn_edges if e.start == node]
+            neighbors.extend([e.start for e in self._graph.nn_edges if e.end == node])
+            filter_list.add(neighbors)
+            self._widget.filter_line_edit.setText(filter_list.text())
+        else:
+            self._normalize_filter()
+            self._normalize_topic_filter()
+            filter_list = FilterList(self._widget.topic_filter_line_edit.text())
+            neighbors = [e.end[1:] for e in self._graph.nt_edges if e.start == node]
+            neighbors.extend([e.start[1:] for e in self._graph.nt_edges if e.end == node])
+            filter_list.add(neighbors)
+            self._widget.topic_filter_line_edit.setText(filter_list.text())
+        self._refresh_rosgraph()
+
+    def hide_topic(self, topic):
+        filter_list = FilterList(self._widget.topic_filter_line_edit.text())
+        filter_list.add("-" + topic)
+        self._widget.topic_filter_line_edit.setText(filter_list.text())
+        self._refresh_rosgraph()
+
+    def show_subscribers(self, topic):
+        self._normalize_filter()
+        topic = " " + topic
+        subs = [e.end for e in self._graph.nt_edges if e.start == topic]
+        self._add_node(subs)
+        self._refresh_rosgraph()
+
+    def show_publishers(self, topic):
+        self._normalize_filter()
+        topic = " " + topic
+        pubs = [e.start for e in self._graph.nt_edges if e.end == topic]
+        self._add_node(pubs)
+        self._refresh_rosgraph()
+
+    def show_subscribers_only(self, topic):
+        self._clear_all()
+        self._filter_normalized = True
+        self._topic_filter_normalized = True
+        topic = " " + topic
+        subs = [e.end for e in self._graph.nt_edges if e.start == topic]
+        self._add_node(subs)
+        self._widget.topic_filter_line_edit.setText(topic)
+        self._refresh_rosgraph()
+
+    def show_publishers_only(self, topic):
+        self._clear_all()
+        self._filter_normalized = True
+        self._topic_filter_normalized = True
+        topic = " " + topic
+        pubs = [e.start for e in self._graph.nt_edges if e.end == topic]
+        self._add_node(pubs)
+        self._widget.topic_filter_line_edit.setText(topic)
+        self._refresh_rosgraph()
+
+    def show_related_nodes_only(self, topic):
+        self._filter_normalized = True
+        filter_list = FilterList()
+        topic = " " + topic
+        subs = [e.end for e in self._graph.nt_edges if e.start == topic]
+        filter_list.add(subs)
+        pubs = [e.start for e in self._graph.nt_edges if e.end == topic]
+        filter_list.add(pubs)
+        self._widget.filter_line_edit.setText(filter_list.text())
+        self._refresh_rosgraph()
+
+    def hide_other_topics(self, topic):
+        self._clear_all()
+        self._filter_normalized = True
+        self._topic_filter_normalized = True
+        topic = " " + topic
+        subs = [e.end for e in self._graph.nt_edges if e.start == topic]
+        self._add_node(subs)
+        pubs = [e.start for e in self._graph.nt_edges if e.end == topic]
+        self._add_node(pubs)
+        self._widget.topic_filter_line_edit.setText(topic)
+        self._refresh_rosgraph()
+
+    def hide_node(self, node):
+        filter_list = FilterList(self._widget.filter_line_edit.text())
+        filter_list.add("-" + node)
+        self._widget.filter_line_edit.setText(filter_list.text())
+        self._refresh_rosgraph()
+
+    def hide_other_node(self, node):
+        self._filter_normalized = True
+        filter_list = FilterList()
+        filter_list.add(node)
+        self._widget.filter_line_edit.setText(filter_list.text())
         self._refresh_rosgraph()
 
     def _update_rosgraph(self):
@@ -294,11 +497,11 @@ class RosGraph(Plugin):
             highlight_level = 1
 
         # layout graph and create qt items
-        (nodes, edges) = self.dot_to_qt.dotcode_to_qt_items(self._current_dotcode,
+        (self.nodes, edges) = self.dot_to_qt.dotcode_to_qt_items(self._current_dotcode,
                                                             highlight_level=highlight_level,
                                                             same_label_siblings=True)
 
-        for node_item in nodes.values():
+        for node_item in self.nodes.values():
             self._scene.addItem(node_item)
         for edge_items in edges.values():
             for edge_item in edge_items:
